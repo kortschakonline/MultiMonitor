@@ -1,0 +1,20 @@
+# SwiftPM build output
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# Built app bundle (regenerable via build.sh)
+MultiMonitor.app/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.xcodeproj/
+xcuserdata/
+
+# Logs
+*.log

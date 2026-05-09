@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import UniformTypeIdentifiers
 
 // MARK: - Models
@@ -36,11 +37,21 @@ final class AppModel: ObservableObject {
     @Published var spanned: MonitorAssignment = .init()
     @Published var perMonitor: [CGDirectDisplayID: MonitorAssignment] = [:]
     @Published var recents: [URL] = []
+    let slideshow = Slideshow()
+    private var cancellables = Set<AnyCancellable>()
     private static let recentsLimit = 20
 
     init() {
         selectedDisplayID = layout.monitors.first?.displayID
+        slideshow.model = self
         restorePersistedState()
+
+        // Persist slideshow settings whenever the user tweaks them.
+        slideshow.objectWillChange
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.savePersistedState() }
+            }
+            .store(in: &cancellables)
     }
 
     func refreshLayout() {
@@ -101,7 +112,7 @@ final class AppModel: ObservableObject {
 
     // MARK: - Loading source images
 
-    func loadSource(_ url: URL) {
+    func loadSource(_ url: URL, addToRecents: Bool = true) {
         var a = activeAssignment
         a.sourceURL = url
         a.sourcePreview = NSImage(contentsOf: url)
@@ -116,7 +127,7 @@ final class AppModel: ObservableObject {
             status = "Bild konnte nicht gelesen werden."
         } else {
             status = "Bild geladen: \(url.lastPathComponent)"
-            addRecent(url)
+            if addToRecents { self.addRecent(url) }
         }
         if a.mode == .manual { ensureManualTransform() }
         savePersistedState()
@@ -332,7 +343,12 @@ final class AppModel: ObservableObject {
             spanned: spanned.persisted,
             perMonitor: pm,
             autoReapply: autoReapply,
-            recents: recents.map(\.path)
+            recents: recents.map(\.path),
+            slideshow: PersistedSlideshow(
+                folderPath: slideshow.folderURL?.path,
+                intervalMinutes: slideshow.intervalMinutes,
+                randomOrder: slideshow.randomOrder
+            )
         )
         Persistence.save(state)
     }
@@ -361,6 +377,16 @@ final class AppModel: ObservableObject {
             .map { URL(fileURLWithPath: $0) }
             .filter { fm.fileExists(atPath: $0.path) }
 
+        // Slideshow settings (don't auto-start)
+        slideshow.intervalMinutes = state.slideshow.intervalMinutes
+        slideshow.randomOrder = state.slideshow.randomOrder
+        if let path = state.slideshow.folderPath {
+            let folder = URL(fileURLWithPath: path)
+            if fm.fileExists(atPath: folder.path) {
+                slideshow.setFolder(folder)
+            }
+        }
+
         if spanned.sourceURL != nil || !perMonitor.isEmpty {
             status = "Letzten Zustand wiederhergestellt."
         }
@@ -372,6 +398,7 @@ final class AppModel: ObservableObject {
 struct ContentView: View {
     @StateObject private var model = AppModel()
     @State private var showRecents = false
+    @State private var showSlideshow = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -412,6 +439,18 @@ struct ContentView: View {
                     : "Letzte Bilder schnell wieder anwenden.")
                 .popover(isPresented: $showRecents, arrowEdge: .bottom) {
                     RecentsView(model: model) { showRecents = false }
+                }
+                Button {
+                    showSlideshow.toggle()
+                } label: {
+                    Label(
+                        model.slideshow.isRunning ? "Slideshow läuft" : "Slideshow",
+                        systemImage: model.slideshow.isRunning ? "play.circle.fill" : "play.circle"
+                    )
+                }
+                .help("Bilder aus einem Ordner automatisch rotieren.")
+                .popover(isPresented: $showSlideshow, arrowEdge: .bottom) {
+                    SlideshowView(slideshow: model.slideshow)
                 }
                 if let url = model.activeAssignment.sourceURL {
                     Text(url.lastPathComponent)
@@ -950,6 +989,157 @@ private func makeThumbnail(url: URL, maxPixelSize: Int) -> NSImage? {
     ]
     guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
     return NSImage(cgImage: cg, size: .zero)
+}
+
+// MARK: - Slideshow popover
+
+private struct SlideshowView: View {
+    @ObservedObject var slideshow: Slideshow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Slideshow")
+                .font(.headline)
+
+            // Folder picker row
+            HStack(alignment: .firstTextBaseline) {
+                Text("Ordner:")
+                    .frame(width: 70, alignment: .leading)
+                if let folder = slideshow.folderURL {
+                    Text(folder.lastPathComponent)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.primary)
+                } else {
+                    Text("Kein Ordner gewählt")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Wählen …") { pickFolder() }
+            }
+
+            HStack {
+                Text("\(slideshow.imageCount) Bild\(slideshow.imageCount == 1 ? "" : "er")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if slideshow.folderURL != nil && slideshow.imageCount == 0 {
+                    Text("· keine unterstützten Formate gefunden")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Spacer()
+                if slideshow.folderURL != nil {
+                    Button("Neu einlesen") { slideshow.reloadImageList() }
+                        .buttonStyle(.borderless)
+                }
+            }
+
+            Divider()
+
+            // Interval
+            HStack(alignment: .firstTextBaseline) {
+                Text("Intervall:")
+                    .frame(width: 70, alignment: .leading)
+                Slider(
+                    value: Binding(
+                        get: { slideshow.intervalMinutes },
+                        set: { slideshow.intervalMinutes = $0 }
+                    ),
+                    in: 1...60, step: 1
+                )
+                Text(intervalLabel)
+                    .font(.callout.monospacedDigit())
+                    .frame(width: 64, alignment: .trailing)
+                    .foregroundStyle(.secondary)
+            }
+
+            // Random toggle
+            Toggle("Zufällige Reihenfolge", isOn: Binding(
+                get: { slideshow.randomOrder },
+                set: { slideshow.randomOrder = $0 }
+            ))
+            .toggleStyle(.checkbox)
+
+            Divider()
+
+            // Status + controls
+            statusRow
+
+            HStack {
+                if slideshow.isRunning {
+                    Button {
+                        slideshow.stop()
+                    } label: {
+                        Label("Stoppen", systemImage: "stop.circle.fill")
+                    }
+                    Button {
+                        slideshow.skipForward()
+                    } label: {
+                        Label("Nächstes", systemImage: "forward.fill")
+                    }
+                } else {
+                    Button {
+                        slideshow.start()
+                    } label: {
+                        Label("Starten", systemImage: "play.fill")
+                    }
+                    .disabled(slideshow.imageCount == 0)
+                    .keyboardShortcut(.return)
+                }
+                Spacer()
+            }
+        }
+        .padding(16)
+        .frame(width: 460)
+    }
+
+    private var intervalLabel: String {
+        let min = Int(slideshow.intervalMinutes)
+        return "\(min) min"
+    }
+
+    @ViewBuilder
+    private var statusRow: some View {
+        TimelineView(.periodic(from: .now, by: 1.0)) { context in
+            VStack(alignment: .leading, spacing: 4) {
+                if let url = slideshow.currentImageURL {
+                    Text("Aktuell: \(url.lastPathComponent)")
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if slideshow.isRunning, let next = slideshow.nextChangeAt {
+                    let remaining = max(0, next.timeIntervalSince(context.date))
+                    Text("Nächster Wechsel in \(formatRemaining(remaining))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if !slideshow.isRunning && slideshow.imageCount > 0 {
+                    Text("Bereit zum Starten.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func formatRemaining(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds.rounded())
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%d:%02d", m, s)
+    }
+
+    private func pickFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Auswählen"
+        if panel.runModal() == .OK, let url = panel.url {
+            slideshow.setFolder(url)
+        }
+    }
 }
 
 // MARK: - Interactive overlay (pan + scroll wheel)

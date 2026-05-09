@@ -17,6 +17,18 @@ struct PersistedAssignment: Codable, Equatable {
     var manualTransform: PersistedTransform?
 }
 
+struct PersistedSlideshow: Codable, Equatable {
+    var folderPath: String?
+    var intervalMinutes: Double
+    var randomOrder: Bool
+
+    static let `default` = PersistedSlideshow(
+        folderPath: nil,
+        intervalMinutes: 5,
+        randomOrder: false
+    )
+}
+
 struct PersistedState: Codable, Equatable {
     var splitMode: String                            // SplitMode rawValue
     var bezelPoints: Double
@@ -24,19 +36,22 @@ struct PersistedState: Codable, Equatable {
     var perMonitor: [String: PersistedAssignment]    // keyed by displayID as string
     var autoReapply: Bool
     var recents: [String] = []                       // file paths, most-recent first
+    var slideshow: PersistedSlideshow = .default
 
     enum CodingKeys: String, CodingKey {
-        case splitMode, bezelPoints, spanned, perMonitor, autoReapply, recents
+        case splitMode, bezelPoints, spanned, perMonitor, autoReapply, recents, slideshow
     }
 
     init(splitMode: String, bezelPoints: Double, spanned: PersistedAssignment,
-         perMonitor: [String: PersistedAssignment], autoReapply: Bool, recents: [String] = []) {
+         perMonitor: [String: PersistedAssignment], autoReapply: Bool,
+         recents: [String] = [], slideshow: PersistedSlideshow = .default) {
         self.splitMode = splitMode
         self.bezelPoints = bezelPoints
         self.spanned = spanned
         self.perMonitor = perMonitor
         self.autoReapply = autoReapply
         self.recents = recents
+        self.slideshow = slideshow
     }
 
     init(from decoder: Decoder) throws {
@@ -47,6 +62,7 @@ struct PersistedState: Codable, Equatable {
         self.perMonitor = try c.decode([String: PersistedAssignment].self, forKey: .perMonitor)
         self.autoReapply = try c.decode(Bool.self, forKey: .autoReapply)
         self.recents = (try? c.decode([String].self, forKey: .recents)) ?? []
+        self.slideshow = (try? c.decode(PersistedSlideshow.self, forKey: .slideshow)) ?? .default
     }
 }
 

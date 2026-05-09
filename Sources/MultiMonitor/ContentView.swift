@@ -26,27 +26,41 @@ enum SplitMode: String, CaseIterable, Identifiable {
 @MainActor
 final class AppModel: ObservableObject {
     @Published var layout: MonitorLayout = .current()
-    @Published var splitMode: SplitMode = .spanned
-    @Published var bezelPoints: CGFloat = 0
-    @Published var selectedMonitorID: Int?
+    @Published var splitMode: SplitMode = .spanned { didSet { savePersistedState() } }
+    @Published var bezelPoints: CGFloat = 0       { didSet { savePersistedState() } }
+    @Published var autoReapply: Bool = true       { didSet { savePersistedState() } }
+    @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var status: String = "Bereit. Ziehe ein Bild hierher."
     @Published var isWorking: Bool = false
 
     @Published var spanned: MonitorAssignment = .init()
-    @Published var perMonitor: [Int: MonitorAssignment] = [:]
+    @Published var perMonitor: [CGDirectDisplayID: MonitorAssignment] = [:]
 
     init() {
-        selectedMonitorID = layout.monitors.first?.id
+        selectedDisplayID = layout.monitors.first?.displayID
+        restorePersistedState()
     }
 
     func refreshLayout() {
+        let oldMonitorCount = layout.monitors.count
         layout = .current()
-        if let id = selectedMonitorID, !layout.monitors.contains(where: { $0.id == id }) {
-            selectedMonitorID = layout.monitors.first?.id
-        } else if selectedMonitorID == nil {
-            selectedMonitorID = layout.monitors.first?.id
+        // Validate selection — if previously selected display is gone, pick first.
+        if let id = selectedDisplayID,
+           !layout.monitors.contains(where: { $0.displayID == id }) {
+            selectedDisplayID = layout.monitors.first?.displayID
+        } else if selectedDisplayID == nil {
+            selectedDisplayID = layout.monitors.first?.displayID
         }
         if activeAssignment.mode == .manual { ensureManualTransform() }
+
+        // Auto-reapply on hot-plug, only if the count actually changed (avoid
+        // re-applying for spurious notifications like wake-from-sleep with
+        // identical setup).
+        if autoReapply,
+           layout.monitors.count != oldMonitorCount,
+           canApply {
+            apply()
+        }
     }
 
     // MARK: - Active assignment dispatch
@@ -56,7 +70,7 @@ final class AppModel: ObservableObject {
             switch splitMode {
             case .spanned: return spanned
             case .perMonitor:
-                guard let id = selectedMonitorID else { return MonitorAssignment() }
+                guard let id = selectedDisplayID else { return MonitorAssignment() }
                 return perMonitor[id] ?? MonitorAssignment()
             }
         }
@@ -64,7 +78,7 @@ final class AppModel: ObservableObject {
             switch splitMode {
             case .spanned: spanned = newValue
             case .perMonitor:
-                guard let id = selectedMonitorID else { return }
+                guard let id = selectedDisplayID else { return }
                 perMonitor[id] = newValue
             }
         }
@@ -77,8 +91,8 @@ final class AppModel: ObservableObject {
         case .spanned:
             return layout.effectiveCanvas(bezelPoints: bezelPoints)
         case .perMonitor:
-            guard let id = selectedMonitorID,
-                  let m = layout.monitors.first(where: { $0.id == id }) else { return .zero }
+            guard let id = selectedDisplayID,
+                  let m = layout.monitors.first(where: { $0.displayID == id }) else { return .zero }
             return CGRect(origin: .zero, size: m.frame.size)
         }
     }
@@ -102,11 +116,12 @@ final class AppModel: ObservableObject {
             status = "Bild geladen: \(url.lastPathComponent)"
         }
         if a.mode == .manual { ensureManualTransform() }
+        savePersistedState()
     }
 
     /// Per-monitor variant: select the given monitor first, then load.
-    func loadSource(_ url: URL, intoMonitorID id: Int) {
-        if splitMode == .perMonitor { selectedMonitorID = id }
+    func loadSource(_ url: URL, intoDisplayID id: CGDirectDisplayID) {
+        if splitMode == .perMonitor { selectedDisplayID = id }
         loadSource(url)
     }
 
@@ -117,6 +132,7 @@ final class AppModel: ObservableObject {
         a.mode = newMode
         activeAssignment = a
         if newMode == .manual { ensureManualTransform() }
+        savePersistedState()
     }
 
     // MARK: - Manual transform
@@ -144,6 +160,12 @@ final class AppModel: ObservableObject {
         let origin = CGPoint(x: (canvas.width - w) / 2, y: (canvas.height - h) / 2)
         a.manualTransform = ManualTransform(imageOrigin: origin, imageSize: CGSize(width: w, height: h))
         activeAssignment = a
+        savePersistedState()
+    }
+
+    /// Persist after a pan/zoom interaction completes (called by overlay on mouseUp).
+    func commitInteractiveTransform() {
+        savePersistedState()
     }
 
     func panBy(canvasDelta: CGSize) {
@@ -219,6 +241,7 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     self.status = "Wallpaper auf \(images.count) Monitor(en) gesetzt."
                     self.isWorking = false
+                    self.savePersistedState()
                 }
             } catch {
                 await MainActor.run {
@@ -231,7 +254,7 @@ final class AppModel: ObservableObject {
 
     private func applyPerMonitor() {
         let pairs: [(MonitorInfo, MonitorAssignment)] = layout.monitors.compactMap { m in
-            guard let a = perMonitor[m.id], a.sourceURL != nil else { return nil }
+            guard let a = perMonitor[m.displayID], a.sourceURL != nil else { return nil }
             return (m, a)
         }
         guard !pairs.isEmpty else {
@@ -263,6 +286,7 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     self.status = "Wallpaper auf \(results.count) von \(totalMonitors) Monitor(en) gesetzt."
                     self.isWorking = false
+                    self.savePersistedState()
                 }
             } catch {
                 await MainActor.run {
@@ -270,6 +294,47 @@ final class AppModel: ObservableObject {
                     self.isWorking = false
                 }
             }
+        }
+    }
+
+    // MARK: - Persistence
+
+    func savePersistedState() {
+        var pm: [String: PersistedAssignment] = [:]
+        for (displayID, a) in perMonitor {
+            pm[String(displayID)] = a.persisted
+        }
+        let state = PersistedState(
+            splitMode: splitMode.rawValue,
+            bezelPoints: Double(bezelPoints),
+            spanned: spanned.persisted,
+            perMonitor: pm,
+            autoReapply: autoReapply
+        )
+        Persistence.save(state)
+    }
+
+    private func restorePersistedState() {
+        guard let state = Persistence.load() else { return }
+        autoReapply = state.autoReapply
+        bezelPoints = CGFloat(state.bezelPoints)
+        splitMode = SplitMode(rawValue: state.splitMode) ?? .spanned
+
+        var spannedAssign = MonitorAssignment(from: state.spanned)
+        spannedAssign.reloadPreview()
+        spanned = spannedAssign
+
+        var pm: [CGDirectDisplayID: MonitorAssignment] = [:]
+        for (idStr, persisted) in state.perMonitor {
+            guard let displayID = CGDirectDisplayID(idStr) else { continue }
+            var a = MonitorAssignment(from: persisted)
+            a.reloadPreview()
+            pm[displayID] = a
+        }
+        perMonitor = pm
+
+        if spanned.sourceURL != nil || !perMonitor.isEmpty {
+            status = "Letzten Zustand wiederhergestellt."
         }
     }
 }
@@ -341,6 +406,12 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                Toggle(isOn: $model.autoReapply) {
+                    Text("Auto-Reapply")
+                        .font(.callout)
+                }
+                .toggleStyle(.checkbox)
+                .help("Beim An- oder Abstecken eines Monitors automatisch erneut anwenden.")
                 Button(action: { model.apply() }) {
                     Label("Anwenden", systemImage: "checkmark.circle.fill")
                 }
@@ -351,7 +422,7 @@ struct ContentView: View {
         .padding(16)
         .frame(minWidth: 700, minHeight: 520)
         .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: nil) { providers in
-            handleDrop(providers: providers, atMonitorID: nil)
+            handleDrop(providers: providers, atDisplayID: nil)
         }
         .onReceive(NotificationCenter.default.publisher(
             for: NSApplication.didChangeScreenParametersNotification
@@ -363,8 +434,8 @@ struct ContentView: View {
     private var displayedStatus: String {
         var s = model.status
         if model.splitMode == .perMonitor,
-           let id = model.selectedMonitorID,
-           let m = model.layout.monitors.first(where: { $0.id == id }) {
+           let id = model.selectedDisplayID,
+           let m = model.layout.monitors.first(where: { $0.displayID == id }) {
             s = "[\(m.name)] " + s
         }
         if model.activeAssignment.mode == .manual && model.activeAssignment.sourcePreview != nil {
@@ -377,8 +448,8 @@ struct ContentView: View {
         switch model.splitMode {
         case .spanned: return "Bild auswählen …"
         case .perMonitor:
-            if let id = model.selectedMonitorID,
-               let m = model.layout.monitors.first(where: { $0.id == id }) {
+            if let id = model.selectedDisplayID,
+               let m = model.layout.monitors.first(where: { $0.displayID == id }) {
                 return "Bild für \(m.name) …"
             }
             return "Bild auswählen …"
@@ -454,7 +525,7 @@ struct ContentView: View {
                             width: local.width * scale,
                             height: local.height * scale
                         )
-                        if let a = model.perMonitor[monitor.id], let img = a.sourcePreview {
+                        if let a = model.perMonitor[monitor.displayID], let img = a.sourcePreview {
                             perMonitorProjectedImage(
                                 img: img,
                                 monitor: monitor,
@@ -480,17 +551,17 @@ struct ContentView: View {
                         monitor: monitor,
                         rect: r,
                         isSelected: model.splitMode == .perMonitor &&
-                                    model.selectedMonitorID == monitor.id,
+                                    model.selectedDisplayID == monitor.displayID,
                         showHint: model.splitMode == .perMonitor &&
-                                  model.perMonitor[monitor.id]?.sourcePreview == nil
+                                  model.perMonitor[monitor.displayID]?.sourcePreview == nil
                     )
                     .onTapGesture {
                         if model.splitMode == .perMonitor {
-                            model.selectedMonitorID = monitor.id
+                            model.selectedDisplayID = monitor.displayID
                         }
                     }
                     .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: nil) { providers in
-                        handleDrop(providers: providers, atMonitorID: monitor.id)
+                        handleDrop(providers: providers, atDisplayID: monitor.displayID)
                     }
                 }
 
@@ -533,8 +604,8 @@ struct ContentView: View {
             return CGRect(x: originX, y: originY,
                           width: canvas.width * scale, height: canvas.height * scale)
         case .perMonitor:
-            guard let id = model.selectedMonitorID,
-                  let m = model.layout.monitors.first(where: { $0.id == id }) else {
+            guard let id = model.selectedDisplayID,
+                  let m = model.layout.monitors.first(where: { $0.displayID == id }) else {
                 return .zero
             }
             let local = model.layout.canvasLocalImageRect(for: m, bezelPoints: 0)
@@ -690,12 +761,12 @@ struct ContentView: View {
         }
     }
 
-    private func handleDrop(providers: [NSItemProvider], atMonitorID monitorID: Int?) -> Bool {
+    private func handleDrop(providers: [NSItemProvider], atDisplayID displayID: CGDirectDisplayID?) -> Bool {
         guard let provider = providers.first else { return false }
         let target: (URL) -> Void = { url in
             DispatchQueue.main.async {
-                if let id = monitorID {
-                    model.loadSource(url, intoMonitorID: id)
+                if let id = displayID {
+                    model.loadSource(url, intoDisplayID: id)
                 } else {
                     model.loadSource(url)
                 }

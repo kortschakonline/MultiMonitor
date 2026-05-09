@@ -4,8 +4,9 @@
 Packages/
 Package.resolved
 
-# Built app bundle (regenerable via build.sh)
+# Built app bundle and release artifacts (regenerable via build.sh)
 MultiMonitor.app/
+MultiMonitor.zip
 
 # macOS
 .DS_Store

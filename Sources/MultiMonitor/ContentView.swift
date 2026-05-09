@@ -2,109 +2,206 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+// MARK: - Models
+
+struct MonitorAssignment {
+    var sourceURL: URL?
+    var sourcePreview: NSImage?
+    var sourcePixelSize: CGSize = .zero
+    var mode: FitMode = .stretch
+    var manualTransform: ManualTransform?
+}
+
+enum SplitMode: String, CaseIterable, Identifiable {
+    case spanned, perMonitor
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .spanned:    return "Spannen"
+        case .perMonitor: return "Pro Monitor"
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var layout: MonitorLayout = .current()
-    @Published var sourceURL: URL?
-    @Published var sourcePreview: NSImage?
-    @Published var sourcePixelSize: CGSize = .zero  // CGImage pixel dims (aspect source)
-    @Published var mode: FitMode = .stretch {
-        didSet { if mode == .manual { ensureManualTransform() } }
-    }
-    @Published var manualTransform: ManualTransform?
+    @Published var splitMode: SplitMode = .spanned
     @Published var bezelPoints: CGFloat = 0
+    @Published var selectedMonitorID: Int?
     @Published var status: String = "Bereit. Ziehe ein Bild hierher."
     @Published var isWorking: Bool = false
 
-    func refreshLayout() {
-        layout = .current()
+    @Published var spanned: MonitorAssignment = .init()
+    @Published var perMonitor: [Int: MonitorAssignment] = [:]
+
+    init() {
+        selectedMonitorID = layout.monitors.first?.id
     }
 
-    func loadSource(_ url: URL) {
-        sourceURL = url
-        sourcePreview = NSImage(contentsOf: url)
-        if let cg = try? WallpaperRenderer.loadCGImage(from: url) {
-            sourcePixelSize = CGSize(width: cg.width, height: cg.height)
-        } else {
-            sourcePixelSize = .zero
+    func refreshLayout() {
+        layout = .current()
+        if let id = selectedMonitorID, !layout.monitors.contains(where: { $0.id == id }) {
+            selectedMonitorID = layout.monitors.first?.id
+        } else if selectedMonitorID == nil {
+            selectedMonitorID = layout.monitors.first?.id
         }
-        if sourcePreview == nil {
+        if activeAssignment.mode == .manual { ensureManualTransform() }
+    }
+
+    // MARK: - Active assignment dispatch
+
+    var activeAssignment: MonitorAssignment {
+        get {
+            switch splitMode {
+            case .spanned: return spanned
+            case .perMonitor:
+                guard let id = selectedMonitorID else { return MonitorAssignment() }
+                return perMonitor[id] ?? MonitorAssignment()
+            }
+        }
+        set {
+            switch splitMode {
+            case .spanned: spanned = newValue
+            case .perMonitor:
+                guard let id = selectedMonitorID else { return }
+                perMonitor[id] = newValue
+            }
+        }
+    }
+
+    /// The canvas the active assignment is positioned in.
+    /// Spanned: bezel-expanded global canvas. PerMonitor: selected display only.
+    var activeCanvas: CGRect {
+        switch splitMode {
+        case .spanned:
+            return layout.effectiveCanvas(bezelPoints: bezelPoints)
+        case .perMonitor:
+            guard let id = selectedMonitorID,
+                  let m = layout.monitors.first(where: { $0.id == id }) else { return .zero }
+            return CGRect(origin: .zero, size: m.frame.size)
+        }
+    }
+
+    // MARK: - Loading source images
+
+    func loadSource(_ url: URL) {
+        var a = activeAssignment
+        a.sourceURL = url
+        a.sourcePreview = NSImage(contentsOf: url)
+        if let cg = try? WallpaperRenderer.loadCGImage(from: url) {
+            a.sourcePixelSize = CGSize(width: cg.width, height: cg.height)
+        } else {
+            a.sourcePixelSize = .zero
+        }
+        a.manualTransform = nil
+        activeAssignment = a
+        if a.sourcePreview == nil {
             status = "Bild konnte nicht gelesen werden."
         } else {
             status = "Bild geladen: \(url.lastPathComponent)"
         }
-        // Re-init manual transform for the new image.
-        manualTransform = nil
-        if mode == .manual { ensureManualTransform() }
+        if a.mode == .manual { ensureManualTransform() }
+    }
+
+    /// Per-monitor variant: select the given monitor first, then load.
+    func loadSource(_ url: URL, intoMonitorID id: Int) {
+        if splitMode == .perMonitor { selectedMonitorID = id }
+        loadSource(url)
+    }
+
+    // MARK: - Mode
+
+    func setMode(_ newMode: FitMode) {
+        var a = activeAssignment
+        a.mode = newMode
+        activeAssignment = a
+        if newMode == .manual { ensureManualTransform() }
     }
 
     // MARK: - Manual transform
 
     func ensureManualTransform() {
-        if manualTransform == nil { resetManualTransform() }
+        if activeAssignment.manualTransform == nil { resetManualTransform() }
     }
 
     func resetManualTransform() {
-        let canvas = layout.effectiveCanvas(bezelPoints: bezelPoints)
-        let imgSize = sourcePixelSize == .zero ? (sourcePreview?.size ?? .zero) : sourcePixelSize
+        let canvas = activeCanvas
+        let a0 = activeAssignment
+        let imgSize = a0.sourcePixelSize == .zero
+            ? (a0.sourcePreview?.size ?? .zero)
+            : a0.sourcePixelSize
+        var a = a0
         guard canvas.width > 0, canvas.height > 0,
               imgSize.width > 0, imgSize.height > 0 else {
-            manualTransform = nil
+            a.manualTransform = nil
+            activeAssignment = a
             return
         }
-        // Default to "fill": image covers the canvas, aspect preserved.
         let scale = max(canvas.width / imgSize.width, canvas.height / imgSize.height)
         let w = imgSize.width * scale
         let h = imgSize.height * scale
         let origin = CGPoint(x: (canvas.width - w) / 2, y: (canvas.height - h) / 2)
-        manualTransform = ManualTransform(
-            imageOrigin: origin,
-            imageSize: CGSize(width: w, height: h)
-        )
+        a.manualTransform = ManualTransform(imageOrigin: origin, imageSize: CGSize(width: w, height: h))
+        activeAssignment = a
     }
 
     func panBy(canvasDelta: CGSize) {
-        guard var t = manualTransform else { return }
+        var a = activeAssignment
+        guard var t = a.manualTransform else { return }
         t.imageOrigin.x += canvasDelta.width
         t.imageOrigin.y += canvasDelta.height
-        manualTransform = t
+        a.manualTransform = t
+        activeAssignment = a
     }
 
-    /// Zoom around a point in canvas-point coordinates.
     func zoom(at canvasPoint: CGPoint, deltaPixels: CGFloat) {
-        guard var t = manualTransform else { return }
-        // Smooth exponential factor; positive scrollingDeltaY = scroll up = zoom in
+        var a = activeAssignment
+        guard var t = a.manualTransform else { return }
         let factor = pow(1.0015, deltaPixels)
         let clampedFactor = max(0.92, min(1.08, factor))
-
-        let canvas = layout.effectiveCanvas(bezelPoints: bezelPoints)
-        let minDim = min(canvas.width, canvas.height) * 0.1   // don't shrink below 10% of canvas
-        let maxDim = max(canvas.width, canvas.height) * 50    // sane upper bound
-
+        let canvas = activeCanvas
+        let minDim = min(canvas.width, canvas.height) * 0.1
+        let maxDim = max(canvas.width, canvas.height) * 50
         let candidateW = t.imageSize.width * clampedFactor
         let candidateH = t.imageSize.height * clampedFactor
         if candidateW < minDim || candidateH < minDim { return }
         if candidateW > maxDim || candidateH > maxDim { return }
-
-        // Keep the canvas point under the cursor pinned to the same image point.
         let newOriginX = canvasPoint.x - (canvasPoint.x - t.imageOrigin.x) * clampedFactor
         let newOriginY = canvasPoint.y - (canvasPoint.y - t.imageOrigin.y) * clampedFactor
-
         t.imageOrigin = CGPoint(x: newOriginX, y: newOriginY)
         t.imageSize = CGSize(width: candidateW, height: candidateH)
-        manualTransform = t
+        a.manualTransform = t
+        activeAssignment = a
+    }
+
+    // MARK: - Apply
+
+    var canApply: Bool {
+        if isWorking { return false }
+        switch splitMode {
+        case .spanned: return spanned.sourceURL != nil
+        case .perMonitor: return perMonitor.values.contains(where: { $0.sourceURL != nil })
+        }
     }
 
     func apply() {
-        guard let url = sourceURL else {
+        switch splitMode {
+        case .spanned:    applySpanned()
+        case .perMonitor: applyPerMonitor()
+        }
+    }
+
+    private func applySpanned() {
+        guard let url = spanned.sourceURL else {
             status = "Erst ein Bild auswählen."
             return
         }
         isWorking = true
         status = "Rendere und setze Wallpaper …"
-        let mode = self.mode
+        let mode = spanned.mode
+        let transform = spanned.manualTransform
         let layout = self.layout
-        let transform = self.manualTransform
         let bezel = self.bezelPoints
 
         Task.detached {
@@ -113,20 +210,58 @@ final class AppModel: ObservableObject {
                 let outDir = WallpaperApplier.outputDirectory
                 let ts = Date().timeIntervalSince1970
                 let images = try WallpaperRenderer.renderPerScreen(
-                    sourceImage: cg,
-                    layout: layout,
-                    mode: mode,
-                    manualTransform: transform,
-                    bezelPoints: bezel,
-                    outputDir: outDir,
-                    timestamp: ts
+                    sourceImage: cg, layout: layout, mode: mode,
+                    manualTransform: transform, bezelPoints: bezel,
+                    outputDir: outDir, timestamp: ts
                 )
-                try await MainActor.run {
-                    try WallpaperApplier.apply(images)
-                }
+                try await MainActor.run { try WallpaperApplier.apply(images) }
                 WallpaperApplier.pruneOldOutputs()
                 await MainActor.run {
                     self.status = "Wallpaper auf \(images.count) Monitor(en) gesetzt."
+                    self.isWorking = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.status = "Fehler: \(error.localizedDescription)"
+                    self.isWorking = false
+                }
+            }
+        }
+    }
+
+    private func applyPerMonitor() {
+        let pairs: [(MonitorInfo, MonitorAssignment)] = layout.monitors.compactMap { m in
+            guard let a = perMonitor[m.id], a.sourceURL != nil else { return nil }
+            return (m, a)
+        }
+        guard !pairs.isEmpty else {
+            status = "Kein Monitor hat ein Bild zugewiesen."
+            return
+        }
+        isWorking = true
+        status = "Rendere und setze \(pairs.count) Wallpaper …"
+        let totalMonitors = layout.monitors.count
+
+        Task.detached {
+            do {
+                let outDir = WallpaperApplier.outputDirectory
+                let ts = Date().timeIntervalSince1970
+                var collected: [PerScreenImage] = []
+                for (monitor, a) in pairs {
+                    guard let url = a.sourceURL else { continue }
+                    let cg = try WallpaperRenderer.loadCGImage(from: url)
+                    let img = try WallpaperRenderer.renderSingleMonitor(
+                        sourceImage: cg, monitor: monitor, mode: a.mode,
+                        manualTransform: a.manualTransform,
+                        outputDir: outDir, timestamp: ts
+                    )
+                    collected.append(img)
+                }
+                let results = collected
+                try await MainActor.run { try WallpaperApplier.apply(results) }
+                WallpaperApplier.pruneOldOutputs()
+                await MainActor.run {
+                    self.status = "Wallpaper auf \(results.count) von \(totalMonitors) Monitor(en) gesetzt."
                     self.isWorking = false
                 }
             } catch {
@@ -155,13 +290,24 @@ struct ContentView: View {
                 )
                 .clipShape(RoundedRectangle(cornerRadius: 10))
 
+            if model.layout.monitors.count >= 2 {
+                Picker("Aufteilung", selection: $model.splitMode) {
+                    ForEach(SplitMode.allCases) { sm in
+                        Text(sm.label).tag(sm)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 320)
+            }
+
             HStack {
                 Button {
                     pickFile()
                 } label: {
-                    Label("Bild auswählen …", systemImage: "photo")
+                    Label(pickFileLabel, systemImage: "photo")
                 }
-                if let url = model.sourceURL {
+                if let url = model.activeAssignment.sourceURL {
                     Text(url.lastPathComponent)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -169,20 +315,23 @@ struct ContentView: View {
                         .truncationMode(.middle)
                 }
                 Spacer()
-                if model.mode == .manual && model.sourcePreview != nil {
+                if model.activeAssignment.mode == .manual && model.activeAssignment.sourcePreview != nil {
                     Button("Zurücksetzen") { model.resetManualTransform() }
                         .help("Bild wieder auf Canvas einpassen (Füllen).")
                 }
             }
 
-            Picker("Modus", selection: $model.mode) {
+            Picker("Modus", selection: Binding(
+                get: { model.activeAssignment.mode },
+                set: { model.setMode($0) }
+            )) {
                 ForEach(FitMode.allCases) { mode in
                     Text(mode.label).tag(mode)
                 }
             }
             .pickerStyle(.segmented)
 
-            if model.layout.monitors.count >= 2 {
+            if model.splitMode == .spanned && model.layout.monitors.count >= 2 {
                 bezelControl
             }
 
@@ -196,27 +345,44 @@ struct ContentView: View {
                     Label("Anwenden", systemImage: "checkmark.circle.fill")
                 }
                 .keyboardShortcut(.return)
-                .disabled(model.sourceURL == nil || model.isWorking)
+                .disabled(!model.canApply)
             }
         }
         .padding(16)
-        .frame(minWidth: 640, minHeight: 480)
+        .frame(minWidth: 700, minHeight: 520)
         .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: nil) { providers in
-            handleDrop(providers: providers)
+            handleDrop(providers: providers, atMonitorID: nil)
         }
         .onReceive(NotificationCenter.default.publisher(
             for: NSApplication.didChangeScreenParametersNotification
         )) { _ in
             model.refreshLayout()
-            if model.mode == .manual { model.ensureManualTransform() }
         }
     }
 
     private var displayedStatus: String {
-        if model.mode == .manual && model.sourcePreview != nil {
-            return model.status + "  ·  Ziehen = verschieben, Scrollen = zoomen"
+        var s = model.status
+        if model.splitMode == .perMonitor,
+           let id = model.selectedMonitorID,
+           let m = model.layout.monitors.first(where: { $0.id == id }) {
+            s = "[\(m.name)] " + s
         }
-        return model.status
+        if model.activeAssignment.mode == .manual && model.activeAssignment.sourcePreview != nil {
+            s += "  ·  Ziehen = verschieben, Scrollen = zoomen"
+        }
+        return s
+    }
+
+    private var pickFileLabel: String {
+        switch model.splitMode {
+        case .spanned: return "Bild auswählen …"
+        case .perMonitor:
+            if let id = model.selectedMonitorID,
+               let m = model.layout.monitors.first(where: { $0.id == id }) {
+                return "Bild für \(m.name) …"
+            }
+            return "Bild auswählen …"
+        }
     }
 
     @ViewBuilder
@@ -232,9 +398,9 @@ struct ContentView: View {
             Slider(
                 value: Binding(
                     get: { Double(model.bezelPoints) },
-                    set: { newVal in
-                        model.bezelPoints = CGFloat(newVal)
-                        if model.mode == .manual { model.resetManualTransform() }
+                    set: { v in
+                        model.bezelPoints = CGFloat(v)
+                        if model.activeAssignment.mode == .manual { model.resetManualTransform() }
                     }
                 ),
                 in: 0...200
@@ -245,7 +411,7 @@ struct ContentView: View {
                 .frame(width: 56, alignment: .trailing)
             Button("0") {
                 model.bezelPoints = 0
-                if model.mode == .manual { model.resetManualTransform() }
+                if model.activeAssignment.mode == .manual { model.resetManualTransform() }
             }
             .buttonStyle(.borderless)
             .help("Bezel-Korrektur ausschalten.")
@@ -258,7 +424,7 @@ struct ContentView: View {
     private var preview: some View {
         GeometryReader { geo in
             let layout = model.layout
-            let bezel = model.bezelPoints
+            let bezel = (model.splitMode == .spanned) ? model.bezelPoints : 0
             let canvas = layout.effectiveCanvas(bezelPoints: bezel)
             let inset: CGFloat = 16
             let availW = max(geo.size.width - inset * 2, 1)
@@ -272,16 +438,36 @@ struct ContentView: View {
             let originY = (geo.size.height - displayH) / 2
 
             ZStack(alignment: .topLeading) {
-                // Image projected onto the canvas using the current mode.
-                // Masked to the union of monitor rects so bezel gaps appear
-                // as actual gaps (the wallpaper output crops the same way).
-                if let img = model.sourcePreview {
-                    projectedImage(img: img, scale: scale)
-                        .mask(monitorsMask(scale: scale))
-                        .offset(x: originX, y: originY)
+                if model.splitMode == .spanned {
+                    if let img = model.spanned.sourcePreview {
+                        spannedProjectedImage(img: img, scale: scale)
+                            .mask(monitorsMask(scale: scale, bezel: bezel))
+                            .offset(x: originX, y: originY)
+                    }
+                } else {
+                    // Per-monitor: each display renders independently
+                    ForEach(layout.monitors) { monitor in
+                        let local = layout.canvasLocalImageRect(for: monitor, bezelPoints: 0)
+                        let r = CGRect(
+                            x: originX + local.minX * scale,
+                            y: originY + local.minY * scale,
+                            width: local.width * scale,
+                            height: local.height * scale
+                        )
+                        if let a = model.perMonitor[monitor.id], let img = a.sourcePreview {
+                            perMonitorProjectedImage(
+                                img: img,
+                                monitor: monitor,
+                                assignment: a,
+                                scale: scale
+                            )
+                            .frame(width: r.width, height: r.height)
+                            .offset(x: r.minX, y: r.minY)
+                        }
+                    }
                 }
 
-                // Monitor outlines on top.
+                // Monitor outlines + selection highlight
                 ForEach(layout.monitors) { monitor in
                     let local = layout.canvasLocalImageRect(for: monitor, bezelPoints: bezel)
                     let r = CGRect(
@@ -290,22 +476,39 @@ struct ContentView: View {
                         width: local.width * scale,
                         height: local.height * scale
                     )
-                    monitorTile(monitor: monitor, rect: r)
+                    monitorTile(
+                        monitor: monitor,
+                        rect: r,
+                        isSelected: model.splitMode == .perMonitor &&
+                                    model.selectedMonitorID == monitor.id,
+                        showHint: model.splitMode == .perMonitor &&
+                                  model.perMonitor[monitor.id]?.sourcePreview == nil
+                    )
+                    .onTapGesture {
+                        if model.splitMode == .perMonitor {
+                            model.selectedMonitorID = monitor.id
+                        }
+                    }
+                    .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: nil) { providers in
+                        handleDrop(providers: providers, atMonitorID: monitor.id)
+                    }
                 }
 
-                // Interactive overlay for manual mode (pan + zoom).
-                if model.mode == .manual && model.sourcePreview != nil {
+                // Interactive overlay (manual mode, attached to active canvas)
+                if model.activeAssignment.mode == .manual,
+                   model.activeAssignment.sourcePreview != nil {
+                    let activeRect = activeCanvasRectInPreview(
+                        scale: scale, bezel: bezel, originX: originX, originY: originY
+                    )
                     InteractiveOverlay(
                         previewScale: scale,
                         onPan: { delta in
-                            // Drag delta is in preview pixels, top-left origin.
                             model.panBy(canvasDelta: CGSize(
                                 width: delta.width / scale,
                                 height: delta.height / scale
                             ))
                         },
                         onZoom: { localPoint, deltaY in
-                            // localPoint is in preview pixels, top-left origin.
                             let canvasPoint = CGPoint(
                                 x: localPoint.x / scale,
                                 y: localPoint.y / scale
@@ -313,58 +516,106 @@ struct ContentView: View {
                             model.zoom(at: canvasPoint, deltaPixels: deltaY)
                         }
                     )
-                    .frame(width: displayW, height: displayH)
-                    .offset(x: originX, y: originY)
+                    .frame(width: activeRect.width, height: activeRect.height)
+                    .offset(x: activeRect.minX, y: activeRect.minY)
                 }
             }
         }
     }
 
+    /// Where (in preview coords) the active canvas sits — used to place the
+    /// interactive overlay for manual pan/zoom.
+    private func activeCanvasRectInPreview(scale: CGFloat, bezel: CGFloat,
+                                           originX: CGFloat, originY: CGFloat) -> CGRect {
+        switch model.splitMode {
+        case .spanned:
+            let canvas = model.layout.effectiveCanvas(bezelPoints: bezel)
+            return CGRect(x: originX, y: originY,
+                          width: canvas.width * scale, height: canvas.height * scale)
+        case .perMonitor:
+            guard let id = model.selectedMonitorID,
+                  let m = model.layout.monitors.first(where: { $0.id == id }) else {
+                return .zero
+            }
+            let local = model.layout.canvasLocalImageRect(for: m, bezelPoints: 0)
+            return CGRect(
+                x: originX + local.minX * scale,
+                y: originY + local.minY * scale,
+                width: local.width * scale,
+                height: local.height * scale
+            )
+        }
+    }
+
+    /// Spanned-mode projection across the bezel-expanded canvas.
     @ViewBuilder
-    private func projectedImage(img: NSImage, scale: CGFloat) -> some View {
+    private func spannedProjectedImage(img: NSImage, scale: CGFloat) -> some View {
         let canvas = model.layout.effectiveCanvas(bezelPoints: model.bezelPoints)
         let canvasW = canvas.width * scale
         let canvasH = canvas.height * scale
         let imgSize = img.size
+        let rect = imageRect(
+            mode: model.spanned.mode,
+            transform: model.spanned.manualTransform,
+            canvasW: canvasW, canvasH: canvasH,
+            imgSize: imgSize, scale: scale
+        )
+        canvasView(img: img, canvasW: canvasW, canvasH: canvasH, rect: rect)
+    }
 
-        // Compute the image's destination rect in canvas-preview coords
-        // (top-left origin, in preview pixels). May extend beyond the canvas
-        // — gets clipped by the outer .clipped() below.
-        let rect: CGRect = {
-            switch model.mode {
-            case .stretch:
-                return CGRect(x: 0, y: 0, width: canvasW, height: canvasH)
+    /// Per-monitor projection — canvas IS the monitor's frame.
+    @ViewBuilder
+    private func perMonitorProjectedImage(
+        img: NSImage, monitor: MonitorInfo, assignment: MonitorAssignment, scale: CGFloat
+    ) -> some View {
+        let canvasW = monitor.frame.width * scale
+        let canvasH = monitor.frame.height * scale
+        let imgSize = img.size
+        let rect = imageRect(
+            mode: assignment.mode,
+            transform: assignment.manualTransform,
+            canvasW: canvasW, canvasH: canvasH,
+            imgSize: imgSize, scale: scale
+        )
+        canvasView(img: img, canvasW: canvasW, canvasH: canvasH, rect: rect)
+    }
 
-            case .fit:
-                let s = min(canvasW / imgSize.width, canvasH / imgSize.height)
-                let w = imgSize.width * s, h = imgSize.height * s
-                return CGRect(x: (canvasW - w) / 2, y: (canvasH - h) / 2, width: w, height: h)
-
-            case .fill:
-                let s = max(canvasW / imgSize.width, canvasH / imgSize.height)
-                let w = imgSize.width * s, h = imgSize.height * s
-                return CGRect(x: (canvasW - w) / 2, y: (canvasH - h) / 2, width: w, height: h)
-
-            case .center:
-                let w = imgSize.width * scale, h = imgSize.height * scale
-                return CGRect(x: (canvasW - w) / 2, y: (canvasH - h) / 2, width: w, height: h)
-
-            case .manual:
-                if let t = model.manualTransform {
-                    return CGRect(
-                        x: t.imageOrigin.x * scale,
-                        y: t.imageOrigin.y * scale,
-                        width: t.imageSize.width * scale,
-                        height: t.imageSize.height * scale
-                    )
-                }
-                return CGRect(x: 0, y: 0, width: canvasW, height: canvasH)
+    private func imageRect(
+        mode: FitMode, transform: ManualTransform?,
+        canvasW: CGFloat, canvasH: CGFloat,
+        imgSize: CGSize, scale: CGFloat
+    ) -> CGRect {
+        switch mode {
+        case .stretch:
+            return CGRect(x: 0, y: 0, width: canvasW, height: canvasH)
+        case .fit:
+            let s = min(canvasW / imgSize.width, canvasH / imgSize.height)
+            let w = imgSize.width * s, h = imgSize.height * s
+            return CGRect(x: (canvasW - w) / 2, y: (canvasH - h) / 2, width: w, height: h)
+        case .fill:
+            let s = max(canvasW / imgSize.width, canvasH / imgSize.height)
+            let w = imgSize.width * s, h = imgSize.height * s
+            return CGRect(x: (canvasW - w) / 2, y: (canvasH - h) / 2, width: w, height: h)
+        case .center:
+            let w = imgSize.width * scale, h = imgSize.height * scale
+            return CGRect(x: (canvasW - w) / 2, y: (canvasH - h) / 2, width: w, height: h)
+        case .manual:
+            if let t = transform {
+                return CGRect(
+                    x: t.imageOrigin.x * scale,
+                    y: t.imageOrigin.y * scale,
+                    width: t.imageSize.width * scale,
+                    height: t.imageSize.height * scale
+                )
             }
-        }()
+            return CGRect(x: 0, y: 0, width: canvasW, height: canvasH)
+        }
+    }
 
+    @ViewBuilder
+    private func canvasView(img: NSImage, canvasW: CGFloat, canvasH: CGFloat, rect: CGRect) -> some View {
         ZStack(alignment: .topLeading) {
-            Color.black
-                .frame(width: canvasW, height: canvasH)
+            Color.black.frame(width: canvasW, height: canvasH)
             Image(nsImage: img)
                 .resizable()
                 .frame(width: max(rect.width, 0), height: max(rect.height, 0))
@@ -375,17 +626,11 @@ struct ContentView: View {
         .clipped()
     }
 
-    /// Mask shape that covers only the visible monitor rectangles (in
-    /// effective-canvas coords scaled to preview). Bezel gaps end up
-    /// transparent → the projected image isn't drawn there.
-    private func monitorsMask(scale: CGFloat) -> some View {
+    private func monitorsMask(scale: CGFloat, bezel: CGFloat) -> some View {
         let layout = model.layout
-        let bezel = model.bezelPoints
         let canvas = layout.effectiveCanvas(bezelPoints: bezel)
         return ZStack(alignment: .topLeading) {
-            // Transparent base sized to effective canvas.
-            Color.clear
-                .frame(width: canvas.width * scale, height: canvas.height * scale)
+            Color.clear.frame(width: canvas.width * scale, height: canvas.height * scale)
             ForEach(layout.monitors) { monitor in
                 let local = layout.canvasLocalImageRect(for: monitor, bezelPoints: bezel)
                 Rectangle()
@@ -397,10 +642,29 @@ struct ContentView: View {
         .frame(width: canvas.width * scale, height: canvas.height * scale, alignment: .topLeading)
     }
 
-    private func monitorTile(monitor: MonitorInfo, rect: CGRect) -> some View {
-        Rectangle()
-            .stroke(monitor.isPrimary ? Color.accentColor : Color.white.opacity(0.7), lineWidth: 2)
-            .background(Color.clear)
+    private func monitorTile(
+        monitor: MonitorInfo, rect: CGRect,
+        isSelected: Bool, showHint: Bool
+    ) -> some View {
+        let strokeColor: Color = {
+            if isSelected { return .accentColor }
+            if monitor.isPrimary { return .accentColor.opacity(0.6) }
+            return .white.opacity(0.7)
+        }()
+        let lineW: CGFloat = isSelected ? 3 : 2
+        return Rectangle()
+            .stroke(strokeColor, lineWidth: lineW)
+            .background(Color.clear.contentShape(Rectangle()))
+            .overlay(alignment: .center) {
+                if showHint {
+                    Text("Bild hierher ziehen")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
             .overlay(alignment: .bottomLeading) {
                 Text("\(monitor.name)\n\(Int(monitor.frame.width))×\(Int(monitor.frame.height))")
                     .font(.system(size: 10, weight: .medium))
@@ -412,7 +676,6 @@ struct ContentView: View {
             }
             .frame(width: rect.width, height: rect.height)
             .offset(x: rect.minX, y: rect.minY)
-            .allowsHitTesting(false)
     }
 
     // MARK: - Input handling
@@ -427,12 +690,21 @@ struct ContentView: View {
         }
     }
 
-    private func handleDrop(providers: [NSItemProvider]) -> Bool {
+    private func handleDrop(providers: [NSItemProvider], atMonitorID monitorID: Int?) -> Bool {
         guard let provider = providers.first else { return false }
+        let target: (URL) -> Void = { url in
+            DispatchQueue.main.async {
+                if let id = monitorID {
+                    model.loadSource(url, intoMonitorID: id)
+                } else {
+                    model.loadSource(url)
+                }
+            }
+        }
         if provider.canLoadObject(ofClass: URL.self) {
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
-                DispatchQueue.main.async { model.loadSource(url) }
+                target(url)
             }
             return true
         }
@@ -440,7 +712,7 @@ struct ContentView: View {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                 if let data = item as? Data,
                    let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    DispatchQueue.main.async { model.loadSource(url) }
+                    target(url)
                 }
             }
             return true
@@ -474,16 +746,12 @@ final class InteractiveCanvasNSView: NSView {
     var onZoom: ((CGPoint, CGFloat) -> Void)?
     private var lastDragPoint: NSPoint?
 
-    override var isFlipped: Bool { true }   // top-left origin to match SwiftUI
+    override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? {
-        // Only swallow events when we have callbacks attached.
         return (onPan != nil || onZoom != nil) ? self : nil
     }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .openHand)
-    }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
 
     override func scrollWheel(with event: NSEvent) {
         let loc = convert(event.locationInWindow, from: nil)

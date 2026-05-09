@@ -121,6 +121,35 @@ enum WallpaperRenderer {
         return results
     }
 
+    /// Render the source image into a single monitor's pixel size — used by
+    /// per-monitor mode where each display has its own image and mode.
+    static func renderSingleMonitor(
+        sourceImage: CGImage,
+        monitor: MonitorInfo,
+        mode: FitMode,
+        manualTransform: ManualTransform? = nil,
+        outputDir: URL,
+        timestamp: TimeInterval
+    ) throws -> PerScreenImage {
+        let pxW = Int((monitor.frame.width * monitor.backingScaleFactor).rounded())
+        let pxH = Int((monitor.frame.height * monitor.backingScaleFactor).rounded())
+        guard pxW > 0, pxH > 0 else { throw RendererError.renderFailed }
+
+        guard let img = drawCanvas(
+            source: sourceImage,
+            canvasPixelWidth: pxW,
+            canvasPixelHeight: pxH,
+            mode: mode,
+            manualTransform: manualTransform,
+            canvasPointSize: monitor.frame.size
+        ) else { throw RendererError.renderFailed }
+
+        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        let fileURL = outputDir.appendingPathComponent("monitor-\(monitor.id)-\(Int(timestamp)).png")
+        try writePNG(img, to: fileURL)
+        return PerScreenImage(monitor: monitor, url: fileURL)
+    }
+
     // MARK: - Canvas drawing
 
     private static func drawCanvas(

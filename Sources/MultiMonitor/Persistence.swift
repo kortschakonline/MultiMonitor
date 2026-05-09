@@ -37,14 +37,17 @@ struct PersistedState: Codable, Equatable {
     var autoReapply: Bool
     var recents: [String] = []                       // file paths, most-recent first
     var slideshow: PersistedSlideshow = .default
+    var showInDock: Bool = true
 
     enum CodingKeys: String, CodingKey {
-        case splitMode, bezelPoints, spanned, perMonitor, autoReapply, recents, slideshow
+        case splitMode, bezelPoints, spanned, perMonitor, autoReapply,
+             recents, slideshow, showInDock
     }
 
     init(splitMode: String, bezelPoints: Double, spanned: PersistedAssignment,
          perMonitor: [String: PersistedAssignment], autoReapply: Bool,
-         recents: [String] = [], slideshow: PersistedSlideshow = .default) {
+         recents: [String] = [], slideshow: PersistedSlideshow = .default,
+         showInDock: Bool = true) {
         self.splitMode = splitMode
         self.bezelPoints = bezelPoints
         self.spanned = spanned
@@ -52,6 +55,7 @@ struct PersistedState: Codable, Equatable {
         self.autoReapply = autoReapply
         self.recents = recents
         self.slideshow = slideshow
+        self.showInDock = showInDock
     }
 
     init(from decoder: Decoder) throws {
@@ -63,6 +67,7 @@ struct PersistedState: Codable, Equatable {
         self.autoReapply = try c.decode(Bool.self, forKey: .autoReapply)
         self.recents = (try? c.decode([String].self, forKey: .recents)) ?? []
         self.slideshow = (try? c.decode(PersistedSlideshow.self, forKey: .slideshow)) ?? .default
+        self.showInDock = (try? c.decode(Bool.self, forKey: .showInDock)) ?? true
     }
 }
 

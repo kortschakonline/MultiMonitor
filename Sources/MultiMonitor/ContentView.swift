@@ -30,6 +30,12 @@ final class AppModel: ObservableObject {
     @Published var splitMode: SplitMode = .spanned { didSet { savePersistedState() } }
     @Published var bezelPoints: CGFloat = 0       { didSet { savePersistedState() } }
     @Published var autoReapply: Bool = true       { didSet { savePersistedState() } }
+    @Published var showInDock: Bool = true        {
+        didSet {
+            NSApp.setActivationPolicy(showInDock ? .regular : .accessory)
+            savePersistedState()
+        }
+    }
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var status: String = "Bereit. Ziehe ein Bild hierher."
     @Published var isWorking: Bool = false
@@ -348,7 +354,8 @@ final class AppModel: ObservableObject {
                 folderPath: slideshow.folderURL?.path,
                 intervalMinutes: slideshow.intervalMinutes,
                 randomOrder: slideshow.randomOrder
-            )
+            ),
+            showInDock: showInDock
         )
         Persistence.save(state)
     }
@@ -358,6 +365,7 @@ final class AppModel: ObservableObject {
         autoReapply = state.autoReapply
         bezelPoints = CGFloat(state.bezelPoints)
         splitMode = SplitMode(rawValue: state.splitMode) ?? .spanned
+        showInDock = state.showInDock
 
         var spannedAssign = MonitorAssignment(from: state.spanned)
         spannedAssign.reloadPreview()
@@ -396,7 +404,7 @@ final class AppModel: ObservableObject {
 // MARK: - ContentView
 
 struct ContentView: View {
-    @StateObject private var model = AppModel()
+    @EnvironmentObject private var model: AppModel
     @State private var showRecents = false
     @State private var showSlideshow = false
 

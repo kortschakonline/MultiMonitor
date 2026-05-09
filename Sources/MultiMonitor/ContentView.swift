@@ -35,6 +35,8 @@ final class AppModel: ObservableObject {
 
     @Published var spanned: MonitorAssignment = .init()
     @Published var perMonitor: [CGDirectDisplayID: MonitorAssignment] = [:]
+    @Published var recents: [URL] = []
+    private static let recentsLimit = 20
 
     init() {
         selectedDisplayID = layout.monitors.first?.displayID
@@ -114,8 +116,28 @@ final class AppModel: ObservableObject {
             status = "Bild konnte nicht gelesen werden."
         } else {
             status = "Bild geladen: \(url.lastPathComponent)"
+            addRecent(url)
         }
         if a.mode == .manual { ensureManualTransform() }
+        savePersistedState()
+    }
+
+    // MARK: - Recents
+
+    func addRecent(_ url: URL) {
+        var list = recents.filter { $0 != url }
+        list.insert(url, at: 0)
+        if list.count > Self.recentsLimit { list = Array(list.prefix(Self.recentsLimit)) }
+        recents = list
+    }
+
+    func removeRecent(_ url: URL) {
+        recents.removeAll { $0 == url }
+        savePersistedState()
+    }
+
+    func clearRecents() {
+        recents.removeAll()
         savePersistedState()
     }
 
@@ -309,7 +331,8 @@ final class AppModel: ObservableObject {
             bezelPoints: Double(bezelPoints),
             spanned: spanned.persisted,
             perMonitor: pm,
-            autoReapply: autoReapply
+            autoReapply: autoReapply,
+            recents: recents.map(\.path)
         )
         Persistence.save(state)
     }
@@ -333,6 +356,11 @@ final class AppModel: ObservableObject {
         }
         perMonitor = pm
 
+        let fm = FileManager.default
+        recents = state.recents
+            .map { URL(fileURLWithPath: $0) }
+            .filter { fm.fileExists(atPath: $0.path) }
+
         if spanned.sourceURL != nil || !perMonitor.isEmpty {
             status = "Letzten Zustand wiederhergestellt."
         }
@@ -343,6 +371,7 @@ final class AppModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var model = AppModel()
+    @State private var showRecents = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -371,6 +400,18 @@ struct ContentView: View {
                     pickFile()
                 } label: {
                     Label(pickFileLabel, systemImage: "photo")
+                }
+                Button {
+                    showRecents.toggle()
+                } label: {
+                    Label("Bibliothek", systemImage: "clock.arrow.circlepath")
+                }
+                .disabled(model.recents.isEmpty)
+                .help(model.recents.isEmpty
+                    ? "Noch keine Bilder geladen."
+                    : "Letzte Bilder schnell wieder anwenden.")
+                .popover(isPresented: $showRecents, arrowEdge: .bottom) {
+                    RecentsView(model: model) { showRecents = false }
                 }
                 if let url = model.activeAssignment.sourceURL {
                     Text(url.lastPathComponent)
@@ -790,6 +831,125 @@ struct ContentView: View {
         }
         return false
     }
+}
+
+// MARK: - Recents popover
+
+private struct RecentsView: View {
+    @ObservedObject var model: AppModel
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Letzte Bilder")
+                    .font(.headline)
+                Spacer()
+                if !model.recents.isEmpty {
+                    Button("Liste leeren") { model.clearRecents() }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.red.opacity(0.85))
+                }
+            }
+            if model.recents.isEmpty {
+                Text("Noch keine Bilder geladen.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 130, maximum: 170), spacing: 10)],
+                        spacing: 10
+                    ) {
+                        ForEach(model.recents, id: \.self) { url in
+                            RecentTile(url: url) {
+                                model.loadSource(url)
+                                dismiss()
+                            } remove: {
+                                model.removeRecent(url)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+            }
+        }
+        .padding(14)
+        .frame(width: 520, height: 360)
+    }
+}
+
+private struct RecentTile: View {
+    let url: URL
+    let action: () -> Void
+    let remove: () -> Void
+
+    @State private var thumbnail: NSImage?
+    @State private var hovered: Bool = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack(alignment: .topTrailing) {
+                Group {
+                    if let img = thumbnail {
+                        Image(nsImage: img)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        Color.secondary.opacity(0.18)
+                            .overlay(ProgressView().controlSize(.small))
+                    }
+                }
+                .frame(height: 88)
+                .frame(maxWidth: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(hovered ? Color.accentColor : Color.secondary.opacity(0.3),
+                                lineWidth: hovered ? 2 : 1)
+                )
+
+                Button(action: remove) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.5))
+                }
+                .buttonStyle(.plain)
+                .padding(4)
+                .help("Aus Liste entfernen.")
+                .opacity(hovered ? 1 : 0)
+            }
+            Text(url.lastPathComponent)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { action() }
+        .onHover { hovered = $0 }
+        .onAppear { loadThumbnail() }
+    }
+
+    private func loadThumbnail() {
+        let url = self.url
+        Task.detached(priority: .userInitiated) {
+            let img = makeThumbnail(url: url, maxPixelSize: 320)
+            await MainActor.run { self.thumbnail = img }
+        }
+    }
+}
+
+private func makeThumbnail(url: URL, maxPixelSize: Int) -> NSImage? {
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let opts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+    return NSImage(cgImage: cg, size: .zero)
 }
 
 // MARK: - Interactive overlay (pan + scroll wheel)

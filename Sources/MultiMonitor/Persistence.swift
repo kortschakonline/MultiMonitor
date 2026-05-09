@@ -23,6 +23,31 @@ struct PersistedState: Codable, Equatable {
     var spanned: PersistedAssignment
     var perMonitor: [String: PersistedAssignment]    // keyed by displayID as string
     var autoReapply: Bool
+    var recents: [String] = []                       // file paths, most-recent first
+
+    enum CodingKeys: String, CodingKey {
+        case splitMode, bezelPoints, spanned, perMonitor, autoReapply, recents
+    }
+
+    init(splitMode: String, bezelPoints: Double, spanned: PersistedAssignment,
+         perMonitor: [String: PersistedAssignment], autoReapply: Bool, recents: [String] = []) {
+        self.splitMode = splitMode
+        self.bezelPoints = bezelPoints
+        self.spanned = spanned
+        self.perMonitor = perMonitor
+        self.autoReapply = autoReapply
+        self.recents = recents
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.splitMode = try c.decode(String.self, forKey: .splitMode)
+        self.bezelPoints = try c.decode(Double.self, forKey: .bezelPoints)
+        self.spanned = try c.decode(PersistedAssignment.self, forKey: .spanned)
+        self.perMonitor = try c.decode([String: PersistedAssignment].self, forKey: .perMonitor)
+        self.autoReapply = try c.decode(Bool.self, forKey: .autoReapply)
+        self.recents = (try? c.decode([String].self, forKey: .recents)) ?? []
+    }
 }
 
 // MARK: - UserDefaults backing

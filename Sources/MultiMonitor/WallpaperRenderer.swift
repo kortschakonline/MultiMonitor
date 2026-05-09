@@ -61,11 +61,12 @@ enum WallpaperRenderer {
         layout: MonitorLayout,
         mode: FitMode,
         manualTransform: ManualTransform? = nil,
+        bezelPoints: CGFloat = 0,
         outputDir: URL,
         timestamp: TimeInterval
     ) throws -> [PerScreenImage] {
 
-        let canvasPixelSize = layout.canvasPixelSize
+        let canvasPixelSize = layout.canvasPixelSize(bezelPoints: bezelPoints)
         let canvasW = Int(canvasPixelSize.width.rounded())
         let canvasH = Int(canvasPixelSize.height.rounded())
         guard canvasW > 0, canvasH > 0 else { throw RendererError.renderFailed }
@@ -76,7 +77,7 @@ enum WallpaperRenderer {
             canvasPixelHeight: canvasH,
             mode: mode,
             manualTransform: manualTransform,
-            canvasPointSize: layout.canvas.size
+            canvasPointSize: layout.effectiveCanvas(bezelPoints: bezelPoints).size
         ) else { throw RendererError.renderFailed }
 
         try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
@@ -84,7 +85,7 @@ enum WallpaperRenderer {
         var results: [PerScreenImage] = []
         for monitor in layout.monitors {
             // Rect in canvas points → canvas pixels (top-left origin)
-            let pointRect = layout.canvasLocalImageRect(for: monitor)
+            let pointRect = layout.canvasLocalImageRect(for: monitor, bezelPoints: bezelPoints)
             let scale = layout.maxBackingScale
             let canvasPixelRect = CGRect(
                 x: (pointRect.minX * scale).rounded(),

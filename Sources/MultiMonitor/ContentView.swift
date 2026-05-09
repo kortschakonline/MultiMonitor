@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
         didSet { if mode == .manual { ensureManualTransform() } }
     }
     @Published var manualTransform: ManualTransform?
+    @Published var bezelPoints: CGFloat = 0
     @Published var status: String = "Bereit. Ziehe ein Bild hierher."
     @Published var isWorking: Bool = false
 
@@ -44,7 +45,7 @@ final class AppModel: ObservableObject {
     }
 
     func resetManualTransform() {
-        let canvas = layout.canvas
+        let canvas = layout.effectiveCanvas(bezelPoints: bezelPoints)
         let imgSize = sourcePixelSize == .zero ? (sourcePreview?.size ?? .zero) : sourcePixelSize
         guard canvas.width > 0, canvas.height > 0,
               imgSize.width > 0, imgSize.height > 0 else {
@@ -76,7 +77,7 @@ final class AppModel: ObservableObject {
         let factor = pow(1.0015, deltaPixels)
         let clampedFactor = max(0.92, min(1.08, factor))
 
-        let canvas = layout.canvas
+        let canvas = layout.effectiveCanvas(bezelPoints: bezelPoints)
         let minDim = min(canvas.width, canvas.height) * 0.1   // don't shrink below 10% of canvas
         let maxDim = max(canvas.width, canvas.height) * 50    // sane upper bound
 
@@ -104,6 +105,7 @@ final class AppModel: ObservableObject {
         let mode = self.mode
         let layout = self.layout
         let transform = self.manualTransform
+        let bezel = self.bezelPoints
 
         Task.detached {
             do {
@@ -115,6 +117,7 @@ final class AppModel: ObservableObject {
                     layout: layout,
                     mode: mode,
                     manualTransform: transform,
+                    bezelPoints: bezel,
                     outputDir: outDir,
                     timestamp: ts
                 )
@@ -179,6 +182,10 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
 
+            if model.layout.monitors.count >= 2 {
+                bezelControl
+            }
+
             HStack {
                 Text(displayedStatus)
                     .font(.callout)
@@ -212,13 +219,47 @@ struct ContentView: View {
         return model.status
     }
 
+    @ViewBuilder
+    private var bezelControl: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "rectangle.split.2x1")
+                .foregroundStyle(.secondary)
+                .help("Bezel-Korrektur: virtuelle Lücke zwischen Monitoren, " +
+                      "damit das Bild physikalisch durchläuft.")
+            Text("Bezel-Lücke")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Slider(
+                value: Binding(
+                    get: { Double(model.bezelPoints) },
+                    set: { newVal in
+                        model.bezelPoints = CGFloat(newVal)
+                        if model.mode == .manual { model.resetManualTransform() }
+                    }
+                ),
+                in: 0...200
+            )
+            Text("\(Int(model.bezelPoints)) pt")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 56, alignment: .trailing)
+            Button("0") {
+                model.bezelPoints = 0
+                if model.mode == .manual { model.resetManualTransform() }
+            }
+            .buttonStyle(.borderless)
+            .help("Bezel-Korrektur ausschalten.")
+        }
+    }
+
     // MARK: - Preview
 
     @ViewBuilder
     private var preview: some View {
         GeometryReader { geo in
             let layout = model.layout
-            let canvas = layout.canvas
+            let bezel = model.bezelPoints
+            let canvas = layout.effectiveCanvas(bezelPoints: bezel)
             let inset: CGFloat = 16
             let availW = max(geo.size.width - inset * 2, 1)
             let availH = max(geo.size.height - inset * 2, 1)
@@ -232,14 +273,17 @@ struct ContentView: View {
 
             ZStack(alignment: .topLeading) {
                 // Image projected onto the canvas using the current mode.
+                // Masked to the union of monitor rects so bezel gaps appear
+                // as actual gaps (the wallpaper output crops the same way).
                 if let img = model.sourcePreview {
                     projectedImage(img: img, scale: scale)
+                        .mask(monitorsMask(scale: scale))
                         .offset(x: originX, y: originY)
                 }
 
                 // Monitor outlines on top.
                 ForEach(layout.monitors) { monitor in
-                    let local = layout.canvasLocalImageRect(for: monitor)
+                    let local = layout.canvasLocalImageRect(for: monitor, bezelPoints: bezel)
                     let r = CGRect(
                         x: originX + local.minX * scale,
                         y: originY + local.minY * scale,
@@ -278,7 +322,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private func projectedImage(img: NSImage, scale: CGFloat) -> some View {
-        let canvas = model.layout.canvas
+        let canvas = model.layout.effectiveCanvas(bezelPoints: model.bezelPoints)
         let canvasW = canvas.width * scale
         let canvasH = canvas.height * scale
         let imgSize = img.size
@@ -329,6 +373,28 @@ struct ContentView: View {
         .frame(width: canvasW, height: canvasH, alignment: .topLeading)
         .compositingGroup()
         .clipped()
+    }
+
+    /// Mask shape that covers only the visible monitor rectangles (in
+    /// effective-canvas coords scaled to preview). Bezel gaps end up
+    /// transparent → the projected image isn't drawn there.
+    private func monitorsMask(scale: CGFloat) -> some View {
+        let layout = model.layout
+        let bezel = model.bezelPoints
+        let canvas = layout.effectiveCanvas(bezelPoints: bezel)
+        return ZStack(alignment: .topLeading) {
+            // Transparent base sized to effective canvas.
+            Color.clear
+                .frame(width: canvas.width * scale, height: canvas.height * scale)
+            ForEach(layout.monitors) { monitor in
+                let local = layout.canvasLocalImageRect(for: monitor, bezelPoints: bezel)
+                Rectangle()
+                    .fill(Color.white)
+                    .frame(width: local.width * scale, height: local.height * scale)
+                    .offset(x: local.minX * scale, y: local.minY * scale)
+            }
+        }
+        .frame(width: canvas.width * scale, height: canvas.height * scale, alignment: .topLeading)
     }
 
     private func monitorTile(monitor: MonitorInfo, rect: CGRect) -> some View {
